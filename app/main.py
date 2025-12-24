@@ -6,9 +6,9 @@ from sqlalchemy import text
 from app.db import SessionLocal
 from app.schemas import PushPayload
 
+import traceback
 
 app = FastAPI(title="PCE Sync API")
-
 
 
 @app.get("/health")
@@ -21,18 +21,18 @@ def get_calibracoes():
     db = SessionLocal()
     try:
         rows = db.execute(
-            text("""
+            text(
+                """
                 SELECT cilindro, area_cm2, carga_maxima_tf
                 FROM calibracoes
                 ORDER BY cilindro
-            """)
+                """
+            )
         ).mappings().all()
 
         return {"calibracoes": list(rows)}
     finally:
         db.close()
-
-
 
 
 @app.post("/sync/push")
@@ -46,10 +46,7 @@ def sync_push(payload: PushPayload):
         ).fetchone()
 
         if row and not payload.overwrite:
-            raise HTTPException(
-                status_code=409,
-                detail="Ensaio já existe. Confirme overwrite.",
-            )
+            raise HTTPException(status_code=409, detail="Ensaio já existe. Confirme overwrite.")
 
         # 2) cliente (sempre atualiza)
         cliente_id = db.execute(
@@ -99,10 +96,7 @@ def sync_push(payload: PushPayload):
 
         # 4) equipamento (substitui último)
         if payload.equipamento:
-            db.execute(
-                text("DELETE FROM equipamentos WHERE estaca_id = :eid"),
-                {"eid": estaca_id},
-            )
+            db.execute(text("DELETE FROM equipamentos WHERE estaca_id = :eid"), {"eid": estaca_id})
             db.execute(
                 text(
                     """
@@ -118,10 +112,7 @@ def sync_push(payload: PushPayload):
             )
 
         # 5) leituras (DELETE + INSERT)
-        db.execute(
-            text("DELETE FROM leituras WHERE estaca_id = :eid"),
-            {"eid": estaca_id},
-        )
+        db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
         for leitura in payload.leituras:
             db.execute(
@@ -164,8 +155,13 @@ def sync_push(payload: PushPayload):
     except HTTPException:
         db.rollback()
         raise
+
     except Exception as e:
         db.rollback()
+        # >>> isto é o que faz aparecer o erro completo no Render <<<
+        print("ERROR /sync/push:", repr(e), flush=True)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         db.close()
