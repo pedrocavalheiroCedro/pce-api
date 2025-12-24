@@ -16,6 +16,25 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/calibracoes")
+def get_calibracoes():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text("""
+                SELECT cilindro, area_cm2, carga_maxima_tf
+                FROM calibracoes
+                ORDER BY cilindro
+            """)
+        ).mappings().all()
+
+        return {"calibracoes": list(rows)}
+    finally:
+        db.close()
+
+
+
+
 @app.post("/sync/push")
 def sync_push(payload: PushPayload):
     db = SessionLocal()
