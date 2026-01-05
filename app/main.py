@@ -1,12 +1,13 @@
 from app import config  # noqa: F401  (garante load_dotenv)
 
+import traceback
+from uuid import UUID
+
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 
 from app.db import SessionLocal
 from app.schemas import PushPayload
-
-import traceback
 
 app = FastAPI(title="PCE Sync API")
 
@@ -15,6 +16,202 @@ app = FastAPI(title="PCE Sync API")
 def health():
     return {"status": "ok"}
 
+
+# ==========================
+# NOVOS ENDPOINTS (ESCRITÓRIO)
+# ==========================
+
+@app.get("/ensaios")
+def list_ensaios():
+    """
+    Lista ensaios (um por estaca.uuid) em formato de resumo para a tela Arquivos do PCE_Escritório.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    e.uuid                    AS uuid,
+                    c.data_ensaio             AS data_ensaio,
+                    c.codigo_obra             AS codigo_obra,
+                    e.estaca_num              AS estaca,
+                    e.carregamento            AS tipo_carregamento,
+                    e.carga_ensaio_tf         AS carga_ensaio_tf,
+                    e.carga_adm_tf            AS carga_adm_tf
+                FROM estacas e
+                JOIN clientes c ON c.id = e.cliente_id
+                ORDER BY
+                    c.data_ensaio DESC NULLS LAST,
+                    c.codigo_obra ASC,
+                    e.estaca_num ASC
+                """
+            )
+        ).mappings().all()
+
+        return {"ensaios": list(rows)}
+    finally:
+        db.close()
+
+
+@app.get("/ensaios/{uuid}")
+def get_ensaio(uuid: UUID):
+    """
+    Retorna o ensaio completo (cliente + estaca + equipamento + leituras),
+    para abrir no PCE_Escritório.
+    """
+    db = SessionLocal()
+    try:
+        estaca_row = db.execute(
+            text(
+                """
+                SELECT
+                    e.id              AS estaca_id,
+                    e.uuid            AS uuid,
+                    e.carregamento    AS carregamento,
+                    e.estaca_num      AS estaca_num,
+                    e.tipo_estaca     AS tipo_estaca,
+                    e.diametro_cm     AS diametro_cm,
+                    e.profundidade_m  AS profundidade_m,
+                    e.carga_adm_tf    AS carga_adm_tf,
+                    e.carga_ensaio_tf AS carga_ensaio_tf,
+
+                    c.codigo_obra     AS codigo_obra,
+                    c.data_ensaio     AS data_ensaio,
+                    c.cliente_nome    AS cliente_nome,
+                    c.resp_obra       AS resp_obra,
+                    c.tec_cedro       AS tec_cedro,
+                    c.endereco        AS endereco,
+                    c.cidade          AS cidade,
+                    c.sondagem        AS sondagem
+                FROM estacas e
+                JOIN clientes c ON c.id = e.cliente_id
+                WHERE e.uuid = :uuid
+                """
+            ),
+            {"uuid": str(uuid)},
+        ).mappings().first()
+
+        if not estaca_row:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado")
+
+        estaca_id = estaca_row["estaca_id"]
+
+        equipamento_row = db.execute(
+            text(
+                """
+                SELECT
+                    leitura,
+                    cilindro_serie, cilindro_area_cm2,
+                    celula_serie,
+                    lvdt_serie01, lvdt_serie02, lvdt_serie03, lvdt_serie04
+                FROM equipamentos
+                WHERE estaca_id = :eid
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"eid": estaca_id},
+        ).mappings().first()
+
+        leituras_rows = db.execute(
+            text(
+                """
+                SELECT
+                    estagio, row_ord,
+                    carga_tf, pressao_kgf_cm2,
+                    horario, tempo_estagio, tempo_estagio_min, tempo_total,
+                    leitura_01, leitura_02, leitura_03, leitura_04,
+                    parcial_01, parcial_02, parcial_03, parcial_04,
+                    total_01, total_02, total_03, total_04,
+                    total_media, estabilizado, porcentagem,
+                    grafico, observacao,
+                    obrigatoria, is_referencia,
+                    ref_override_01, ref_override_02, ref_override_03, ref_override_04
+                FROM leituras
+                WHERE estaca_id = :eid
+                ORDER BY estagio ASC, row_ord ASC
+                """
+            ),
+            {"eid": estaca_id},
+        ).mappings().all()
+
+        cliente = {
+            "codigo_obra": estaca_row["codigo_obra"],
+            "data_ensaio": estaca_row["data_ensaio"],
+            "cliente_nome": estaca_row["cliente_nome"],
+            "resp_obra": estaca_row["resp_obra"],
+            "tec_cedro": estaca_row["tec_cedro"],
+            "endereco": estaca_row["endereco"],
+            "cidade": estaca_row["cidade"],
+            "sondagem": estaca_row["sondagem"],
+        }
+
+        estaca = {
+            "uuid": estaca_row["uuid"],
+            "carregamento": estaca_row["carregamento"],
+            "estaca_num": estaca_row["estaca_num"],
+            "tipo_estaca": estaca_row["tipo_estaca"],
+            "diametro_cm": estaca_row["diametro_cm"],
+            "profundidade_m": estaca_row["profundidade_m"],
+            "carga_adm_tf": estaca_row["carga_adm_tf"],
+            "carga_ensaio_tf": estaca_row["carga_ensaio_tf"],
+        }
+
+        return {
+            "cliente": cliente,
+            "estaca": estaca,
+            "equipamento": dict(equipamento_row) if equipamento_row else None,
+            "leituras": list(leituras_rows),
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/ensaios/{uuid}")
+def delete_ensaio(uuid: UUID):
+    """
+    Exclui ensaio do banco on-line.
+    Como o /sync/push cria um cliente "por ensaio", removemos também o cliente associado.
+    """
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT id, cliente_id FROM estacas WHERE uuid = :uuid"),
+            {"uuid": str(uuid)},
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado")
+
+        estaca_id, cliente_id = row[0], row[1]
+
+        db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
+        db.execute(text("DELETE FROM equipamentos WHERE estaca_id = :eid"), {"eid": estaca_id})
+        db.execute(text("DELETE FROM estacas WHERE id = :eid"), {"eid": estaca_id})
+        db.execute(text("DELETE FROM clientes WHERE id = :cid"), {"cid": cliente_id})
+
+        db.commit()
+        return {"status": "ok"}
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception as e:
+        db.rollback()
+        print("ERROR DELETE /ensaios:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        db.close()
+
+
+# ==========================
+# ENDPOINTS EXISTENTES (CAMPO)
+# ==========================
 
 @app.get("/calibracoes")
 def get_calibracoes():
