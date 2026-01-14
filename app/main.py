@@ -1,4 +1,5 @@
 from app import config  # noqa: F401  (garante load_dotenv)
+from app.schemas import PushPayload, CalibracaoIn  # adicione CalibracaoIn aqui
 
 import traceback
 from uuid import UUID
@@ -7,7 +8,6 @@ from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from app.schemas import PushPayload
 
 app = FastAPI(title="PCE Sync API")
 
@@ -230,6 +230,91 @@ def get_calibracoes():
         return {"calibracoes": list(rows)}
     finally:
         db.close()
+
+
+
+@app.put("/calibracoes/{cilindro}")
+def upsert_calibracao(cilindro: str, payload: CalibracaoIn):
+    """
+    Cria/atualiza calibração por cilindro (UPSERT).
+    Isso resolve o "Novo" do escritório e também as edições na tabela.
+    """
+    db = SessionLocal()
+    try:
+        cil = cilindro.strip()
+
+        if not cil:
+            raise HTTPException(status_code=400, detail="cilindro inválido")
+
+        area = payload.area_cm2 or 0.0
+        carga = payload.carga_maxima_tf or 0.0
+
+        db.execute(
+            text(
+                """
+                INSERT INTO calibracoes (cilindro, area_cm2, carga_maxima_tf)
+                VALUES (:cilindro, :area_cm2, :carga_maxima_tf)
+                ON CONFLICT (cilindro)
+                DO UPDATE SET
+                    area_cm2 = EXCLUDED.area_cm2,
+                    carga_maxima_tf = EXCLUDED.carga_maxima_tf
+                """
+            ),
+            {"cilindro": cil, "area_cm2": area, "carga_maxima_tf": carga},
+        )
+
+        db.commit()
+        return {"status": "ok", "cilindro": cil}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR PUT /calibracoes:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.delete("/calibracoes/{cilindro}")
+def delete_calibracao(cilindro: str):
+    """
+    Exclui calibração por cilindro.
+    """
+    db = SessionLocal()
+    try:
+        cil = cilindro.strip()
+        if not cil:
+            raise HTTPException(status_code=400, detail="cilindro inválido")
+
+        res = db.execute(
+            text("DELETE FROM calibracoes WHERE cilindro = :cilindro"),
+            {"cilindro": cil},
+        )
+
+        # res.rowcount funciona na maioria dos drivers; se vier None, tudo bem.
+        if getattr(res, "rowcount", None) == 0:
+            raise HTTPException(status_code=404, detail="Não encontrado")
+
+        db.commit()
+        return {"status": "ok"}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR DELETE /calibracoes:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+
+
 
 
 @app.post("/sync/push")
