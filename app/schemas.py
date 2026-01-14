@@ -3,6 +3,38 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+
+
+class EnsaioPatch(BaseModel):
+    # Cliente
+    codigo_obra: Optional[str] = None
+    cliente_nome: Optional[str] = None
+    resp_obra: Optional[str] = None
+    tec_cedro: Optional[str] = None
+    endereco: Optional[str] = None
+    cidade: Optional[str] = None
+    data_ensaio: Optional[str] = None
+    sondagem: Optional[str] = None
+
+    # Estaca
+    tipo_carregamento: Optional[str] = None
+    estaca_num: Optional[str] = None
+    tipo_estaca: Optional[str] = None
+    diametro_cm: Optional[float] = None
+    comprimento_cm: Optional[float] = None
+    carga_adm_tf: Optional[float] = None
+    carga_ensaio_tf: Optional[float] = None
+
+    # Equipamentos (mapeia para equipamentos.leitura / lvdt_serieXX)
+    leitura_equipamento: Optional[str] = None
+    cilindro_serie: Optional[str] = None
+    cilindro_area_cm2: Optional[float] = None
+    celula_serie: Optional[str] = None
+    extensometro_01: Optional[str] = None
+    extensometro_02: Optional[str] = None
+    extensometro_03: Optional[str] = None
+    extensometro_04: Optional[str] = None
+
 class CalibracaoIn(BaseModel):
     cilindro: str
     area_cm2: Optional[float] = 0.0

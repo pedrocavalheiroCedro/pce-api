@@ -1,5 +1,5 @@
 from app import config  # noqa: F401  (garante load_dotenv)
-from app.schemas import PushPayload, CalibracaoIn  # adicione CalibracaoIn aqui
+from app.schemas import PushPayload, CalibracaoIn, EnsaioPatch  # adicione CalibracaoIn aqui
 
 import traceback
 from uuid import UUID
@@ -207,6 +207,158 @@ def delete_ensaio(uuid: UUID):
 
     finally:
         db.close()
+
+
+
+@app.patch("/ensaios/{uuid}")
+def patch_ensaio(uuid: UUID, body: EnsaioPatch):
+    db = SessionLocal()
+    try:
+        # 1) localizar estaca e cliente
+        estaca_row = db.execute(
+            text("SELECT id, cliente_id FROM estacas WHERE uuid = :uuid"),
+            {"uuid": str(uuid)},
+        ).mappings().first()
+
+        if not estaca_row:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado.")
+
+        estaca_id = estaca_row["id"]
+        cliente_id = estaca_row["cliente_id"]
+
+        data = body.model_dump(exclude_unset=True)
+
+        # 2) UPDATE CLIENTE (só o que veio no PATCH)
+        cliente_fields_map = {
+            "codigo_obra": "codigo_obra",
+            "cliente_nome": "cliente_nome",
+            "resp_obra": "resp_obra",
+            "tec_cedro": "tec_cedro",
+            "endereco": "endereco",
+            "cidade": "cidade",
+            "data_ensaio": "data_ensaio",
+            "sondagem": "sondagem",
+        }
+
+        sets = []
+        params = {"cid": cliente_id}
+        for k, col in cliente_fields_map.items():
+            if k in data:
+                sets.append(f"{col} = :{k}")
+                params[k] = data[k]
+
+        if sets:
+            db.execute(
+                text(f"UPDATE clientes SET {', '.join(sets)} WHERE id = :cid"),
+                params,
+            )
+
+        # 3) UPDATE ESTACA
+        estaca_sets = []
+        estaca_params = {"uuid": str(uuid)}
+
+        if "tipo_carregamento" in data:
+            estaca_sets.append("carregamento = :tipo_carregamento")
+            estaca_params["tipo_carregamento"] = data["tipo_carregamento"]
+
+        if "estaca_num" in data:
+            estaca_sets.append("estaca_num = :estaca_num")
+            estaca_params["estaca_num"] = data["estaca_num"]
+
+        if "tipo_estaca" in data:
+            estaca_sets.append("tipo_estaca = :tipo_estaca")
+            estaca_params["tipo_estaca"] = data["tipo_estaca"]
+
+        if "diametro_cm" in data:
+            estaca_sets.append("diametro_cm = :diametro_cm")
+            estaca_params["diametro_cm"] = data["diametro_cm"]
+
+        if "comprimento_cm" in data:
+            # banco usa profundidade_m
+            try:
+                profundidade_m = float(data["comprimento_cm"]) / 100.0
+            except Exception:
+                profundidade_m = None
+            estaca_sets.append("profundidade_m = :profundidade_m")
+            estaca_params["profundidade_m"] = profundidade_m
+
+        if "carga_adm_tf" in data:
+            estaca_sets.append("carga_adm_tf = :carga_adm_tf")
+            estaca_params["carga_adm_tf"] = data["carga_adm_tf"]
+
+        if "carga_ensaio_tf" in data:
+            estaca_sets.append("carga_ensaio_tf = :carga_ensaio_tf")
+            estaca_params["carga_ensaio_tf"] = data["carga_ensaio_tf"]
+
+        if estaca_sets:
+            db.execute(
+                text(f"UPDATE estacas SET {', '.join(estaca_sets)} WHERE uuid = :uuid"),
+                estaca_params,
+            )
+
+        # 4) UPDATE/REPLACE EQUIPAMENTOS (mescla com o que já existe)
+        equip_keys = {
+            "leitura_equipamento": "leitura",
+            "cilindro_serie": "cilindro_serie",
+            "cilindro_area_cm2": "cilindro_area_cm2",
+            "celula_serie": "celula_serie",
+            "extensometro_01": "lvdt_serie01",
+            "extensometro_02": "lvdt_serie02",
+            "extensometro_03": "lvdt_serie03",
+            "extensometro_04": "lvdt_serie04",
+        }
+
+        if any(k in data for k in equip_keys):
+            current = db.execute(
+                text("SELECT * FROM equipamentos WHERE estaca_id = :eid ORDER BY id DESC LIMIT 1"),
+                {"eid": estaca_id},
+            ).mappings().first()
+            current = dict(current) if current else {}
+
+            merged = {
+                "leitura": current.get("leitura"),
+                "cilindro_serie": current.get("cilindro_serie"),
+                "cilindro_area_cm2": current.get("cilindro_area_cm2"),
+                "celula_serie": current.get("celula_serie"),
+                "lvdt_serie01": current.get("lvdt_serie01"),
+                "lvdt_serie02": current.get("lvdt_serie02"),
+                "lvdt_serie03": current.get("lvdt_serie03"),
+                "lvdt_serie04": current.get("lvdt_serie04"),
+            }
+
+            for k, col in equip_keys.items():
+                if k in data:
+                    merged[col] = data[k]
+
+            db.execute(text("DELETE FROM equipamentos WHERE estaca_id = :eid"), {"eid": estaca_id})
+            db.execute(
+                text(
+                    """
+                    INSERT INTO equipamentos (
+                        estaca_id, leitura, cilindro_serie, cilindro_area_cm2, celula_serie,
+                        lvdt_serie01, lvdt_serie02, lvdt_serie03, lvdt_serie04
+                    ) VALUES (
+                        :estaca_id, :leitura, :cilindro_serie, :cilindro_area_cm2, :celula_serie,
+                        :lvdt_serie01, :lvdt_serie02, :lvdt_serie03, :lvdt_serie04
+                    )
+                    """
+                ),
+                {"estaca_id": estaca_id, **merged},
+            )
+
+        db.commit()
+        return {"status": "ok"}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
 
 
 # ==========================
