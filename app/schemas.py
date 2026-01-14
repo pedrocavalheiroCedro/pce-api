@@ -3,6 +3,11 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+class CalibracaoIn(BaseModel):
+    cilindro: str
+    area_cm2: Optional[float] = 0.0
+    carga_maxima_tf: Optional[float] = 0.0
+
 
 class ClienteIn(BaseModel):
     codigo_obra: str
