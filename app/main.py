@@ -154,6 +154,7 @@ def get_ensaio(uuid: UUID):
         }
 
         estaca = {
+            "estaca_id": estaca_row["estaca_id"],  # ✅ ADICIONE ISTO
             "uuid": estaca_row["uuid"],
             "carregamento": estaca_row["carregamento"],
             "estaca_num": estaca_row["estaca_num"],
