@@ -297,8 +297,8 @@ def patch_leitura(leitura_id: int, body: LeituraPatch):
     try:
         data = body.model_dump(exclude_unset=True)
 
-        # ✅ melhoria 2: whitelist de colunas (ignora campos inesperados)
         ALLOWED = {
++           "row_ord",
             "carga_tf", "pressao_kgf_cm2",
             "horario", "tempo_estagio", "tempo_estagio_min", "tempo_total",
             "leitura_01", "leitura_02", "leitura_03", "leitura_04",
