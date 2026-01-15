@@ -4,6 +4,46 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class LeituraPatch(BaseModel):
+    carga_tf: Optional[float] = None
+    pressao_kgf_cm2: Optional[float] = None
+
+    horario: Optional[str] = None
+    tempo_estagio: Optional[float] = None
+    tempo_estagio_min: Optional[float] = None
+    tempo_total: Optional[str] = None
+
+    leitura_01: Optional[float] = None
+    leitura_02: Optional[float] = None
+    leitura_03: Optional[float] = None
+    leitura_04: Optional[float] = None
+
+    parcial_01: Optional[float] = None
+    parcial_02: Optional[float] = None
+    parcial_03: Optional[float] = None
+    parcial_04: Optional[float] = None
+
+    total_01: Optional[float] = None
+    total_02: Optional[float] = None
+    total_03: Optional[float] = None
+    total_04: Optional[float] = None
+
+    total_media: Optional[float] = None
+    estabilizado: Optional[str] = None
+    porcentagem: Optional[float] = None
+
+    grafico: Optional[str] = None
+    observacao: Optional[str] = None
+
+    obrigatoria: Optional[int] = None
+    is_referencia: Optional[int] = None
+
+    ref_override_01: Optional[int] = None
+    ref_override_02: Optional[int] = None
+    ref_override_03: Optional[int] = None
+    ref_override_04: Optional[int] = None
+
+
 
 class EnsaioPatch(BaseModel):
     # Cliente

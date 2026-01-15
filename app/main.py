@@ -1,6 +1,7 @@
 from app import config  # noqa: F401  (garante load_dotenv)
-from app.schemas import PushPayload, CalibracaoIn, EnsaioPatch  # adicione CalibracaoIn aqui
-
+from app.schemas import PushPayload, CalibracaoIn, EnsaioPatch, LeituraIn, LeituraPatch
+from typing import List, Union
+from fastapi import Body
 import traceback
 from uuid import UUID
 
@@ -50,6 +51,10 @@ def list_ensaios():
         ).mappings().all()
 
         return {"ensaios": list(rows)}
+    except Exception as e:
+        print("ERROR /ensaios:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
@@ -118,6 +123,7 @@ def get_ensaio(uuid: UUID):
             text(
                 """
                 SELECT
+                    id,
                     estagio, row_ord,
                     carga_tf, pressao_kgf_cm2,
                     horario, tempo_estagio, tempo_estagio_min, tempo_total,
@@ -165,6 +171,170 @@ def get_ensaio(uuid: UUID):
             "leituras": list(leituras_rows),
         }
 
+    finally:
+        db.close()
+
+
+# =====================================================
+# ENDPOINTS DE LEITURAS (para leituras_*_page do escritório)
+# =====================================================
+
+@app.get("/leituras")
+def list_leituras(estaca_id: int):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    estaca_id,
+                    estagio, row_ord,
+                    carga_tf, pressao_kgf_cm2,
+                    horario, tempo_estagio, tempo_estagio_min, tempo_total,
+                    leitura_01, leitura_02, leitura_03, leitura_04,
+                    parcial_01, parcial_02, parcial_03, parcial_04,
+                    total_01, total_02, total_03, total_04,
+                    total_media, estabilizado, porcentagem,
+                    grafico, observacao,
+                    obrigatoria, is_referencia,
+                    ref_override_01, ref_override_02, ref_override_03, ref_override_04
+                FROM leituras
+                WHERE estaca_id = :eid
+                ORDER BY estagio ASC, row_ord ASC
+                """
+            ),
+            {"eid": estaca_id},
+        ).mappings().all()
+
+        return {"data": list(rows)}
+
+    except Exception as e:
+        # ✅ melhoria 1: tratamento de erro + log
+        print("ERROR /leituras:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        db.close()
+
+
+@app.post("/leituras")
+def create_leituras(payload: Union[dict, List[dict]] = Body(...)):
+    """
+    Aceita 1 leitura (dict) ou lista de leituras (bulk).
+    Necessita estaca_id dentro de cada item.
+    """
+    db = SessionLocal()
+    try:
+        items = payload if isinstance(payload, list) else [payload]
+
+        created = []
+        for raw in items:
+            estaca_id = raw.get("estaca_id")
+            if not estaca_id:
+                raise HTTPException(status_code=400, detail="estaca_id é obrigatório")
+
+            # valida apenas os campos do schema (campos extras são ignorados aqui)
+            leitura = LeituraIn(**{k: raw.get(k) for k in LeituraIn.model_fields.keys()})
+
+            new_id = db.execute(
+                text(
+                    """
+                    INSERT INTO leituras
+                    (
+                        estaca_id, estagio, row_ord,
+                        carga_tf, pressao_kgf_cm2,
+                        horario, tempo_estagio, tempo_estagio_min, tempo_total,
+                        leitura_01, leitura_02, leitura_03, leitura_04,
+                        parcial_01, parcial_02, parcial_03, parcial_04,
+                        total_01, total_02, total_03, total_04,
+                        total_media, estabilizado, porcentagem,
+                        grafico, observacao,
+                        obrigatoria, is_referencia,
+                        ref_override_01, ref_override_02, ref_override_03, ref_override_04
+                    )
+                    VALUES
+                    (
+                        :estaca_id, :estagio, :row_ord,
+                        :carga_tf, :pressao_kgf_cm2,
+                        :horario, :tempo_estagio, :tempo_estagio_min, :tempo_total,
+                        :leitura_01, :leitura_02, :leitura_03, :leitura_04,
+                        :parcial_01, :parcial_02, :parcial_03, :parcial_04,
+                        :total_01, :total_02, :total_03, :total_04,
+                        :total_media, :estabilizado, :porcentagem,
+                        :grafico, :observacao,
+                        :obrigatoria, :is_referencia,
+                        :ref_override_01, :ref_override_02, :ref_override_03, :ref_override_04
+                    )
+                    RETURNING id
+                    """
+                ),
+                {"estaca_id": int(estaca_id), **leitura.model_dump()},
+            ).scalar_one()
+
+            created.append({"id": new_id, "estaca_id": int(estaca_id), **leitura.model_dump()})
+
+        db.commit()
+        return {"data": created}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR POST /leituras:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.patch("/leituras/{leitura_id}")
+def patch_leitura(leitura_id: int, body: LeituraPatch):
+    db = SessionLocal()
+    try:
+        data = body.model_dump(exclude_unset=True)
+
+        # ✅ melhoria 2: whitelist de colunas (ignora campos inesperados)
+        ALLOWED = {
+            "carga_tf", "pressao_kgf_cm2",
+            "horario", "tempo_estagio", "tempo_estagio_min", "tempo_total",
+            "leitura_01", "leitura_02", "leitura_03", "leitura_04",
+            "parcial_01", "parcial_02", "parcial_03", "parcial_04",
+            "total_01", "total_02", "total_03", "total_04",
+            "total_media", "estabilizado", "porcentagem",
+            "grafico", "observacao",
+            "obrigatoria", "is_referencia",
+            "ref_override_01", "ref_override_02", "ref_override_03", "ref_override_04",
+        }
+        data = {k: v for k, v in data.items() if k in ALLOWED}
+
+        if not data:
+            return {"status": "ok"}
+
+        sets = [f"{k} = :{k}" for k in data.keys()]
+        data["id"] = leitura_id
+
+        res = db.execute(
+            text(f"UPDATE leituras SET {', '.join(sets)} WHERE id = :id"),
+            data,
+        )
+
+        if getattr(res, "rowcount", None) == 0:
+            raise HTTPException(status_code=404, detail="Leitura não encontrada")
+
+        db.commit()
+        return {"status": "ok"}
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR PATCH /leituras:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
