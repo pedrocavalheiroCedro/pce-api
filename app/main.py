@@ -298,7 +298,7 @@ def patch_leitura(leitura_id: int, body: LeituraPatch):
         data = body.model_dump(exclude_unset=True)
 
         ALLOWED = {
-+           "row_ord",
+            "row_ord",
             "carga_tf", "pressao_kgf_cm2",
             "horario", "tempo_estagio", "tempo_estagio_min", "tempo_total",
             "leitura_01", "leitura_02", "leitura_03", "leitura_04",
