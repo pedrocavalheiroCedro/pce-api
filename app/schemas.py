@@ -44,7 +44,6 @@ class LeituraPatch(BaseModel):
     ref_override_04: Optional[int] = None
 
 
-
 class EnsaioPatch(BaseModel):
     # Cliente
     codigo_obra: Optional[str] = None
@@ -74,6 +73,7 @@ class EnsaioPatch(BaseModel):
     extensometro_02: Optional[str] = None
     extensometro_03: Optional[str] = None
     extensometro_04: Optional[str] = None
+
 
 class CalibracaoIn(BaseModel):
     cilindro: str
@@ -163,3 +163,30 @@ class PushPayload(BaseModel):
     estaca: EstacaIn
     equipamento: Optional[EquipamentoIn] = None
     leituras: List[LeituraIn]
+
+
+# =========================
+# NOVO: Batch update leituras
+# =========================
+
+class LeituraBatchItem(BaseModel):
+    """
+    Uma atualização parcial para UMA leitura existente.
+    - leitura_id: id da tabela leituras
+    - patch: campos a atualizar (igual LeituraPatch)
+    """
+    leitura_id: int
+    patch: LeituraPatch
+
+
+class LeiturasBatchRequest(BaseModel):
+    """
+    Atualiza N leituras de um mesmo ensaio (uuid) em um único request.
+    """
+    ensaio_uuid: UUID
+    items: List[LeituraBatchItem]
+
+
+class LeiturasBatchResponse(BaseModel):
+    ok: bool = True
+    updated: int = 0
