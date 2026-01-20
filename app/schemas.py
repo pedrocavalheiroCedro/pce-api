@@ -1,43 +1,34 @@
 from typing import List, Optional
 from uuid import UUID
-
 from pydantic import BaseModel
 
 
 class LeituraPatch(BaseModel):
     carga_tf: Optional[float] = None
     pressao_kgf_cm2: Optional[float] = None
-
     horario: Optional[str] = None
     tempo_estagio: Optional[float] = None
     tempo_estagio_min: Optional[float] = None
     tempo_total: Optional[str] = None
-
     leitura_01: Optional[float] = None
     leitura_02: Optional[float] = None
     leitura_03: Optional[float] = None
     leitura_04: Optional[float] = None
-
     parcial_01: Optional[float] = None
     parcial_02: Optional[float] = None
     parcial_03: Optional[float] = None
     parcial_04: Optional[float] = None
-
     total_01: Optional[float] = None
     total_02: Optional[float] = None
     total_03: Optional[float] = None
     total_04: Optional[float] = None
-
     total_media: Optional[float] = None
     estabilizado: Optional[str] = None
     porcentagem: Optional[float] = None
-
     grafico: Optional[str] = None
     observacao: Optional[str] = None
-
     obrigatoria: Optional[int] = None
     is_referencia: Optional[int] = None
-
     ref_override_01: Optional[int] = None
     ref_override_02: Optional[int] = None
     ref_override_03: Optional[int] = None
@@ -64,7 +55,7 @@ class EnsaioPatch(BaseModel):
     carga_adm_tf: Optional[float] = None
     carga_ensaio_tf: Optional[float] = None
 
-    # Equipamentos (mapeia para equipamentos.leitura / lvdt_serieXX)
+    # Equipamentos
     leitura_equipamento: Optional[str] = None
     cilindro_serie: Optional[str] = None
     cilindro_area_cm2: Optional[float] = None
@@ -101,7 +92,6 @@ class EstacaIn(BaseModel):
     profundidade_m: Optional[float] = None
     carga_adm_tf: Optional[float] = None
     carga_ensaio_tf: Optional[float] = None
-    # ⚠️ não exigimos 'origem' do campo aqui (API define automaticamente)
 
 
 class EquipamentoIn(BaseModel):
@@ -166,10 +156,6 @@ class PushPayload(BaseModel):
     leituras: List[LeituraIn]
 
 
-# =========================
-# Batch update leituras
-# =========================
-
 class LeituraBatchItem(BaseModel):
     leitura_id: int
     patch: LeituraPatch
@@ -185,10 +171,6 @@ class LeiturasBatchResponse(BaseModel):
     updated: int = 0
 
 
-# =========================
-# NOVO: duplicar ensaio (escritório)
-# =========================
-
 class DuplicarEnsaioRequest(BaseModel):
     ensaio_uuid: UUID
 
@@ -197,3 +179,4 @@ class DuplicarEnsaioResponse(BaseModel):
     ok: bool = True
     original_uuid: UUID
     novo_uuid: UUID
+    origem: str  # ex: "Escritorio 00"
