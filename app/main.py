@@ -213,13 +213,12 @@ def _find_estaca_by_codigo_estaca(db, codigo_obra: str, estaca_num: str):
     ).mappings().first()
     return row
 
-
 def _push_impl(payload: PushPayload):
     db = SessionLocal()
     try:
         overwrite = bool(getattr(payload, "overwrite", False))
 
-        # -------- Cliente (upsert simples por codigo_obra + data_ensaio como já estava) --------
+        # -------- Cliente (upsert simples por codigo_obra + data_ensaio) --------
         cli = payload.cliente.model_dump()
         codigo_obra = (cli.get("codigo_obra") or "").strip()
         data_ensaio = cli.get("data_ensaio")
@@ -254,7 +253,6 @@ def _push_impl(payload: PushPayload):
         est_uuid = str(est.get("uuid"))
         estaca_num = (est.get("estaca_num") or "").strip()
 
-        # 1) se já existe por UUID, segue fluxo normal (update no mesmo uuid)
         row_est_by_uuid = db.execute(
             text("SELECT id, origem, uuid_origem FROM estacas WHERE uuid = :uuid LIMIT 1"),
             {"uuid": est_uuid},
@@ -266,32 +264,22 @@ def _push_impl(payload: PushPayload):
             uuid_origem_atual = row_est_by_uuid.get("uuid_origem")
 
             est["cliente_id"] = cliente_id
-
             params = {k: v for k, v in est.items() if k != "uuid"}
             set_clause = ", ".join([f"{k} = :{k}" for k in params.keys()])
             params["id"] = estaca_id
             db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), params)
 
-            # marca como campo/uuid_origem se faltando
             if not origem_atual:
-                db.execute(
-                    text("UPDATE estacas SET origem = 'campo' WHERE id = :id"),
-                    {"id": estaca_id},
-                )
+                db.execute(text("UPDATE estacas SET origem = 'campo' WHERE id = :id"), {"id": estaca_id})
             if not uuid_origem_atual:
-                db.execute(
-                    text("UPDATE estacas SET uuid_origem = uuid WHERE id = :id"),
-                    {"id": estaca_id},
-                )
+                db.execute(text("UPDATE estacas SET uuid_origem = uuid WHERE id = :id"), {"id": estaca_id})
 
         else:
-            # 2) se NÃO existe por uuid, checa regra antiga "exists" por (codigo_obra + estaca_num)
+            # regra "exists" antiga por (codigo_obra + estaca_num)
             row_exist = _find_estaca_by_codigo_estaca(db, codigo_obra, estaca_num)
 
             if row_exist:
-                # existe um ensaio com mesmo codigo/estaca
                 if not overwrite:
-                    # ✅ comportamento antigo: 409 para o app do campo perguntar sobrescrita
                     raise HTTPException(
                         status_code=409,
                         detail={
@@ -303,25 +291,22 @@ def _push_impl(payload: PushPayload):
                         },
                     )
 
-                # overwrite=True: reaproveita o registro existente, atualiza tudo e TROCA o UUID
                 estaca_id = int(row_exist["id"])
 
-                # atualiza estaca inteira, incluindo uuid, origem e uuid_origem
                 est_update = {k: v for k, v in est.items() if k != "uuid"}
                 est_update["cliente_id"] = cliente_id
                 est_update["uuid"] = est_uuid
                 est_update["origem"] = "campo"
-                est_update["uuid_origem"] = est_uuid  # campo: aponta para si mesmo
+                est_update["uuid_origem"] = est_uuid
 
                 set_clause = ", ".join([f"{k} = :{k}" for k in est_update.keys()])
                 est_update["id"] = estaca_id
                 db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), est_update)
 
             else:
-                # 3) não existe -> cria novo como campo
                 est["cliente_id"] = cliente_id
                 est["origem"] = "campo"
-                est["uuid_origem"] = est_uuid  # campo: aponta para si mesmo
+                est["uuid_origem"] = est_uuid
 
                 cols = ", ".join(est.keys())
                 vals = ", ".join([f":{k}" for k in est.keys()])
@@ -330,8 +315,7 @@ def _push_impl(payload: PushPayload):
                     est,
                 ).scalar_one()
 
-        # -------- Equipamentos e Leituras --------
-        # Se overwrite em estaca existente, sempre substitui leituras e (re)insere equipamentos como estava antes
+        # -------- Equipamentos (mantém comportamento: insere uma linha) --------
         eq = payload.equipamento.model_dump() if payload.equipamento else {}
         if eq:
             eq["estaca_id"] = estaca_id
@@ -339,14 +323,26 @@ def _push_impl(payload: PushPayload):
             vals = ", ".join([f":{k}" for k in eq.keys()])
             db.execute(text(f"INSERT INTO equipamentos ({cols}) VALUES ({vals})"), eq)
 
+        # -------- Leituras (BULK INSERT) --------
         db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
+        # monta lista de dicts
+        rows = []
         for leitura in payload.leituras:
-            row = leitura.model_dump()
-            row["estaca_id"] = estaca_id
-            cols = ", ".join(row.keys())
-            vals = ", ".join([f":{k}" for k in row.keys()])
-            db.execute(text(f"INSERT INTO leituras ({cols}) VALUES ({vals})"), row)
+            d = leitura.model_dump()
+            d["estaca_id"] = estaca_id
+            rows.append(d)
+
+        if rows:
+            # garante colunas na mesma ordem do primeiro item
+            cols = list(rows[0].keys())
+            cols_sql = ", ".join(cols)
+            vals_sql = ", ".join([f":{c}" for c in cols])
+
+            insert_sql = text(f"INSERT INTO leituras ({cols_sql}) VALUES ({vals_sql})")
+
+            # executa em lote (400 linhas é tranquilo)
+            db.execute(insert_sql, rows)
 
         db.commit()
         return {"ok": True, "uuid": est_uuid}
