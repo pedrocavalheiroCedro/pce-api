@@ -122,7 +122,6 @@ def get_ensaio(uuid: UUID):
             {"eid": estaca_id},
         ).mappings().first()
 
-        # leituras
         leituras_rows = db.execute(
             text(
                 """
@@ -162,7 +161,6 @@ def get_ensaio(uuid: UUID):
             "uuid": estaca_row["uuid"],
             "uuid_origem": estaca_row["uuid_origem"],
             "origem": estaca_row["origem"],
-
             "carregamento": estaca_row["carregamento"],
             "estaca_num": estaca_row["estaca_num"],
             "tipo_estaca": estaca_row["tipo_estaca"],
@@ -184,13 +182,46 @@ def get_ensaio(uuid: UUID):
 
 # =====================================================
 # PUSH (CAMPO)
+# - compatível com o app do campo (usa /sync/push)
+# - regra exists por (codigo_obra + estaca_num) retornando 409
 # =====================================================
+
+def _find_estaca_by_codigo_estaca(db, codigo_obra: str, estaca_num: str):
+    """
+    Procura um ensaio existente pelo par (codigo_obra + estaca_num).
+    Retorna: {id, uuid, cliente_id} ou None
+    """
+    if not codigo_obra or not estaca_num:
+        return None
+
+    row = db.execute(
+        text(
+            """
+            SELECT
+                e.id AS id,
+                e.uuid AS uuid,
+                e.cliente_id AS cliente_id
+            FROM estacas e
+            JOIN clientes c ON c.id = e.cliente_id
+            WHERE c.codigo_obra = :codigo_obra
+              AND e.estaca_num = :estaca_num
+            ORDER BY e.id DESC
+            LIMIT 1
+            """
+        ),
+        {"codigo_obra": codigo_obra, "estaca_num": estaca_num},
+    ).mappings().first()
+    return row
+
 
 def _push_impl(payload: PushPayload):
     db = SessionLocal()
     try:
+        overwrite = bool(getattr(payload, "overwrite", False))
+
+        # -------- Cliente (upsert simples por codigo_obra + data_ensaio como já estava) --------
         cli = payload.cliente.model_dump()
-        codigo_obra = cli.get("codigo_obra")
+        codigo_obra = (cli.get("codigo_obra") or "").strip()
         data_ensaio = cli.get("data_ensaio")
 
         row_cli = db.execute(
@@ -218,28 +249,30 @@ def _push_impl(payload: PushPayload):
                 cli,
             ).scalar_one()
 
+        # -------- Estaca --------
         est = payload.estaca.model_dump()
         est_uuid = str(est.get("uuid"))
+        estaca_num = (est.get("estaca_num") or "").strip()
 
-        row_est = db.execute(
+        # 1) se já existe por UUID, segue fluxo normal (update no mesmo uuid)
+        row_est_by_uuid = db.execute(
             text("SELECT id, origem, uuid_origem FROM estacas WHERE uuid = :uuid LIMIT 1"),
             {"uuid": est_uuid},
         ).mappings().first()
 
-        if row_est:
-            estaca_id = row_est["id"]
-            origem_atual = row_est.get("origem")
-            uuid_origem_atual = row_est.get("uuid_origem")
+        if row_est_by_uuid:
+            estaca_id = row_est_by_uuid["id"]
+            origem_atual = row_est_by_uuid.get("origem")
+            uuid_origem_atual = row_est_by_uuid.get("uuid_origem")
 
             est["cliente_id"] = cliente_id
 
-            # update da estaca (não mexe em uuid)
             params = {k: v for k, v in est.items() if k != "uuid"}
             set_clause = ", ".join([f"{k} = :{k}" for k in params.keys()])
             params["id"] = estaca_id
             db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), params)
 
-            # se ainda não tem origem/uuid_origem, fixa como campo
+            # marca como campo/uuid_origem se faltando
             if not origem_atual:
                 db.execute(
                     text("UPDATE estacas SET origem = 'campo' WHERE id = :id"),
@@ -252,18 +285,53 @@ def _push_impl(payload: PushPayload):
                 )
 
         else:
-            est["cliente_id"] = cliente_id
-            est["origem"] = "campo"
-            est["uuid_origem"] = est_uuid  # campo: aponta para si mesmo
+            # 2) se NÃO existe por uuid, checa regra antiga "exists" por (codigo_obra + estaca_num)
+            row_exist = _find_estaca_by_codigo_estaca(db, codigo_obra, estaca_num)
 
-            cols = ", ".join(est.keys())
-            vals = ", ".join([f":{k}" for k in est.keys()])
-            estaca_id = db.execute(
-                text(f"INSERT INTO estacas ({cols}) VALUES ({vals}) RETURNING id"),
-                est,
-            ).scalar_one()
+            if row_exist:
+                # existe um ensaio com mesmo codigo/estaca
+                if not overwrite:
+                    # ✅ comportamento antigo: 409 para o app do campo perguntar sobrescrita
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "exists",
+                            "by": "codigo_obra+estaca_num",
+                            "codigo_obra": codigo_obra,
+                            "estaca_num": estaca_num,
+                            "existing_uuid": str(row_exist.get("uuid") or ""),
+                        },
+                    )
 
-        # equipamentos: insere linha
+                # overwrite=True: reaproveita o registro existente, atualiza tudo e TROCA o UUID
+                estaca_id = int(row_exist["id"])
+
+                # atualiza estaca inteira, incluindo uuid, origem e uuid_origem
+                est_update = {k: v for k, v in est.items() if k != "uuid"}
+                est_update["cliente_id"] = cliente_id
+                est_update["uuid"] = est_uuid
+                est_update["origem"] = "campo"
+                est_update["uuid_origem"] = est_uuid  # campo: aponta para si mesmo
+
+                set_clause = ", ".join([f"{k} = :{k}" for k in est_update.keys()])
+                est_update["id"] = estaca_id
+                db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), est_update)
+
+            else:
+                # 3) não existe -> cria novo como campo
+                est["cliente_id"] = cliente_id
+                est["origem"] = "campo"
+                est["uuid_origem"] = est_uuid  # campo: aponta para si mesmo
+
+                cols = ", ".join(est.keys())
+                vals = ", ".join([f":{k}" for k in est.keys()])
+                estaca_id = db.execute(
+                    text(f"INSERT INTO estacas ({cols}) VALUES ({vals}) RETURNING id"),
+                    est,
+                ).scalar_one()
+
+        # -------- Equipamentos e Leituras --------
+        # Se overwrite em estaca existente, sempre substitui leituras e (re)insere equipamentos como estava antes
         eq = payload.equipamento.model_dump() if payload.equipamento else {}
         if eq:
             eq["estaca_id"] = estaca_id
@@ -271,7 +339,6 @@ def _push_impl(payload: PushPayload):
             vals = ", ".join([f":{k}" for k in eq.keys()])
             db.execute(text(f"INSERT INTO equipamentos ({cols}) VALUES ({vals})"), eq)
 
-        # leituras: substitui
         db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
         for leitura in payload.leituras:
@@ -284,6 +351,9 @@ def _push_impl(payload: PushPayload):
         db.commit()
         return {"ok": True, "uuid": est_uuid}
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         print("ERROR push:", repr(e), flush=True)
@@ -293,14 +363,26 @@ def _push_impl(payload: PushPayload):
         db.close()
 
 
+# Endpoints "novos"
 @app.post("/push")
 def push(payload: PushPayload):
     return _push_impl(payload)
 
 
-# ✅ Alias para compatibilidade com o app de CAMPO (corrige o Not Found do upload)
 @app.post("/upload")
 def upload(payload: PushPayload):
+    return _push_impl(payload)
+
+
+# ✅ Compatibilidade com o app do CAMPO (ele chama /sync/push)
+@app.post("/sync/push")
+def sync_push(payload: PushPayload):
+    return _push_impl(payload)
+
+
+# ✅ Compatibilidade extra (caso algum build chame /sync/upload)
+@app.post("/sync/upload")
+def sync_upload(payload: PushPayload):
     return _push_impl(payload)
 
 
@@ -309,9 +391,6 @@ def upload(payload: PushPayload):
 # =====================================================
 
 def _next_escritorio_label(db, uuid_origem: str) -> str:
-    """
-    Calcula o próximo 'Escritorio XX' baseado em estacas já duplicadas com o mesmo uuid_origem.
-    """
     rows = db.execute(
         text(
             """
@@ -342,7 +421,6 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
     try:
         original_uuid = str(payload.ensaio_uuid)
 
-        # pega estaca original
         est_row = db.execute(
             text("SELECT * FROM estacas WHERE uuid = :uuid LIMIT 1"),
             {"uuid": original_uuid},
@@ -353,10 +431,7 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
         estaca_id_old = int(est_row["id"])
         cliente_id_old = int(est_row["cliente_id"])
 
-        # determina uuid_origem "pai"
         uuid_origem = str(est_row.get("uuid_origem") or original_uuid)
-
-        # calcula origem versão
         origem_label = _next_escritorio_label(db, uuid_origem)
 
         # copia cliente
@@ -440,9 +515,3 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-
-
-# =====================================================
-# (restante: leituras/calibracoes/patch ensaio)
-# Mantém seus endpoints existentes aqui como já estavam.
-# =====================================================
