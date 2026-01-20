@@ -470,18 +470,19 @@ def list_calibracoes():
                     id,
                     cilindro,
                     area_cm2,
-                    carga_maxima_tf,
-                    celula_carga,
-                    leitura,
-                    lvdt_serie01, lvdt_serie02, lvdt_serie03, lvdt_serie04
+                    carga_maxima_tf
                 FROM calibracoes
                 ORDER BY id ASC
                 """
             )
         ).mappings().all()
         return {"calibracoes": list(rows)}
+    except Exception as e:
+        # importante para você enxergar o motivo real no response/log
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
 
 
 @app.post("/calibracoes")
