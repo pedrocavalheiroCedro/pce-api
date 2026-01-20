@@ -459,6 +459,7 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
 # CALIBRACOES / PUSH (iguais ao seu arquivo atual)
 # =====================================================
 
+
 @app.get("/calibracoes")
 def list_calibracoes():
     db = SessionLocal()
