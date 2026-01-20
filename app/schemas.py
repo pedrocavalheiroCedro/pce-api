@@ -101,6 +101,7 @@ class EstacaIn(BaseModel):
     profundidade_m: Optional[float] = None
     carga_adm_tf: Optional[float] = None
     carga_ensaio_tf: Optional[float] = None
+    # ⚠️ não exigimos 'origem' do campo aqui (API define automaticamente)
 
 
 class EquipamentoIn(BaseModel):
@@ -166,23 +167,15 @@ class PushPayload(BaseModel):
 
 
 # =========================
-# NOVO: Batch update leituras
+# Batch update leituras
 # =========================
 
 class LeituraBatchItem(BaseModel):
-    """
-    Uma atualização parcial para UMA leitura existente.
-    - leitura_id: id da tabela leituras
-    - patch: campos a atualizar (igual LeituraPatch)
-    """
     leitura_id: int
     patch: LeituraPatch
 
 
 class LeiturasBatchRequest(BaseModel):
-    """
-    Atualiza N leituras de um mesmo ensaio (uuid) em um único request.
-    """
     ensaio_uuid: UUID
     items: List[LeituraBatchItem]
 
@@ -190,3 +183,17 @@ class LeiturasBatchRequest(BaseModel):
 class LeiturasBatchResponse(BaseModel):
     ok: bool = True
     updated: int = 0
+
+
+# =========================
+# NOVO: duplicar ensaio (escritório)
+# =========================
+
+class DuplicarEnsaioRequest(BaseModel):
+    ensaio_uuid: UUID
+
+
+class DuplicarEnsaioResponse(BaseModel):
+    ok: bool = True
+    original_uuid: UUID
+    novo_uuid: UUID

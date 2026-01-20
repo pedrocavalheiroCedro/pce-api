@@ -1,4 +1,12 @@
 from app import config  # noqa: F401 (garante load_dotenv)
+
+import traceback
+from uuid import UUID, uuid4
+
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import text
+
+from app.db import SessionLocal
 from app.schemas import (
     PushPayload,
     CalibracaoIn,
@@ -7,14 +15,9 @@ from app.schemas import (
     LeituraPatch,
     LeiturasBatchRequest,
     LeiturasBatchResponse,
+    DuplicarEnsaioRequest,
+    DuplicarEnsaioResponse,
 )
-import traceback
-from uuid import UUID
-
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
-
-from app.db import SessionLocal
 
 app = FastAPI(title="PCE Sync API")
 
@@ -25,7 +28,7 @@ def health():
 
 
 # ==========================
-# NOVOS ENDPOINTS (ESCRITÓRIO)
+# ENSAIOS (ESCRITÓRIO)
 # ==========================
 
 @app.get("/ensaios")
@@ -37,6 +40,7 @@ def list_ensaios():
                 """
                 SELECT
                     e.uuid                    AS uuid,
+                    e.origem                  AS origem,
                     c.data_ensaio             AS data_ensaio,
                     c.codigo_obra             AS codigo_obra,
                     e.estaca_num              AS estaca,
@@ -72,6 +76,8 @@ def get_ensaio(uuid: UUID):
                 SELECT
                     e.id              AS estaca_id,
                     e.uuid            AS uuid,
+                    e.origem          AS origem,
+
                     e.carregamento    AS carregamento,
                     e.estaca_num      AS estaca_num,
                     e.tipo_estaca     AS tipo_estaca,
@@ -118,7 +124,7 @@ def get_ensaio(uuid: UUID):
             {"eid": estaca_id},
         ).mappings().first()
 
-        # patch do capmax (já aplicado no seu main.py atual)
+        # patch do capmax
         cal_row = None
         try:
             if equipamento_row and equipamento_row.get("cilindro_serie"):
@@ -174,6 +180,8 @@ def get_ensaio(uuid: UUID):
         estaca = {
             "estaca_id": estaca_row["estaca_id"],
             "uuid": estaca_row["uuid"],
+            "origem": estaca_row["origem"],
+
             "carregamento": estaca_row["carregamento"],
             "estaca_num": estaca_row["estaca_num"],
             "tipo_estaca": estaca_row["tipo_estaca"],
@@ -201,7 +209,7 @@ def get_ensaio(uuid: UUID):
 
 
 # =====================================================
-# ENDPOINTS DE LEITURAS
+# LEITURAS
 # =====================================================
 
 @app.get("/leituras")
@@ -280,19 +288,13 @@ def delete_leitura(leitura_id: int):
 
 
 # =====================================================
-# NOVO: BATCH UPDATE DE LEITURAS POR ENSAIO UUID
+# BATCH UPDATE DE LEITURAS POR ENSAIO UUID
 # =====================================================
 
 @app.post("/leituras/batch", response_model=LeiturasBatchResponse)
 def batch_patch_leituras(payload: LeiturasBatchRequest):
-    """
-    Atualiza várias leituras (linhas) de um único ensaio em 1 request.
-    - payload.ensaio_uuid: UUID da estaca
-    - payload.items: lista {leitura_id, patch{...}}
-    """
     db = SessionLocal()
     try:
-        # Resolve estaca_id (uma vez)
         estaca_row = db.execute(
             text("SELECT id FROM estacas WHERE uuid = :uuid"),
             {"uuid": str(payload.ensaio_uuid)},
@@ -303,11 +305,9 @@ def batch_patch_leituras(payload: LeiturasBatchRequest):
 
         estaca_id = estaca_row["id"]
 
-        # Se não tem nada para atualizar, ok.
         if not payload.items:
             return LeiturasBatchResponse(ok=True, updated=0)
 
-        # Valida que todas as leituras pertencem ao ensaio (evita update fora do ensaio)
         ids = [it.leitura_id for it in payload.items]
         rows = db.execute(
             text(
@@ -321,7 +321,6 @@ def batch_patch_leituras(payload: LeiturasBatchRequest):
         ).mappings().all()
         allowed_ids = {r["id"] for r in rows}
 
-        # Atualiza em transação única
         updated = 0
         for it in payload.items:
             if it.leitura_id not in allowed_ids:
@@ -456,9 +455,8 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
 
 
 # =====================================================
-# CALIBRACOES / PUSH (iguais ao seu arquivo atual)
+# CALIBRACOES
 # =====================================================
-
 
 @app.get("/calibracoes")
 def list_calibracoes():
@@ -479,11 +477,9 @@ def list_calibracoes():
         ).mappings().all()
         return {"calibracoes": list(rows)}
     except Exception as e:
-        # importante para você enxergar o motivo real no response/log
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-
 
 
 @app.post("/calibracoes")
@@ -527,6 +523,10 @@ def delete_calibracao(cal_id: int):
         db.close()
 
 
+# =====================================================
+# PUSH (CAMPO) -> grava origem="campo" ao CRIAR
+# =====================================================
+
 @app.post("/push")
 def push(payload: PushPayload):
     db = SessionLocal()
@@ -563,19 +563,34 @@ def push(payload: PushPayload):
         est = payload.estaca.model_dump()
         est_uuid = str(est.get("uuid"))
 
+        # busca também origem atual
         row_est = db.execute(
-            text("SELECT id FROM estacas WHERE uuid = :uuid LIMIT 1"),
+            text("SELECT id, origem FROM estacas WHERE uuid = :uuid LIMIT 1"),
             {"uuid": est_uuid},
         ).mappings().first()
+
         if row_est:
             estaca_id = row_est["id"]
+            origem_atual = row_est.get("origem")
+
             est["cliente_id"] = cliente_id
-            set_clause = ", ".join([f"{k} = :{k}" for k in est.keys() if k != "uuid"])
-            params = {k: v for k, v in est.items() if k != "uuid"}
+            # não mexe em uuid nem origem por update padrão
+            set_clause = ", ".join([f"{k} = :{k}" for k in est.keys() if k not in ("uuid",)])
+            params = {k: v for k, v in est.items() if k not in ("uuid",)}
             params["id"] = estaca_id
             db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), params)
+
+            # ✅ se ainda não tem origem, marca como campo
+            if not origem_atual:
+                db.execute(
+                    text("UPDATE estacas SET origem = :origem WHERE id = :id"),
+                    {"origem": "campo", "id": estaca_id},
+                )
+
         else:
             est["cliente_id"] = cliente_id
+            # ✅ ao inserir vindo do campo, define origem='campo'
+            est["origem"] = "campo"
             cols = ", ".join(est.keys())
             vals = ", ".join([f":{k}" for k in est.keys()])
             estaca_id = db.execute(
@@ -583,12 +598,15 @@ def push(payload: PushPayload):
                 est,
             ).scalar_one()
 
-        eq = payload.equipamento.model_dump()
-        eq["estaca_id"] = estaca_id
-        cols = ", ".join(eq.keys())
-        vals = ", ".join([f":{k}" for k in eq.keys()])
-        db.execute(text(f"INSERT INTO equipamentos ({cols}) VALUES ({vals})"), eq)
+        # Equipamentos (insere nova linha)
+        eq = (payload.equipamento.model_dump() if payload.equipamento else {})
+        if eq:
+            eq["estaca_id"] = estaca_id
+            cols = ", ".join(eq.keys())
+            vals = ", ".join([f":{k}" for k in eq.keys()])
+            db.execute(text(f"INSERT INTO equipamentos ({cols}) VALUES ({vals})"), eq)
 
+        # Leituras: substitui
         db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
         for leitura in payload.leituras:
@@ -604,6 +622,126 @@ def push(payload: PushPayload):
     except Exception as e:
         db.rollback()
         print("ERROR /push:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# =====================================================
+# NOVO: DUPLICAR ENSAIO (ESCRITÓRIO)
+# - copia cliente, estaca, TODOS equipamentos e leituras
+# - gera novo UUID
+# - seta estacas.origem = 'escritorio'
+# =====================================================
+
+@app.post("/ensaios/duplicar", response_model=DuplicarEnsaioResponse)
+def duplicar_ensaio(payload: DuplicarEnsaioRequest):
+    db = SessionLocal()
+    try:
+        original_uuid = str(payload.ensaio_uuid)
+
+        # 1) pega estaca original
+        est_row = db.execute(
+            text(
+                """
+                SELECT
+                    e.*,
+                    e.id AS estaca_id
+                FROM estacas e
+                WHERE e.uuid = :uuid
+                LIMIT 1
+                """
+            ),
+            {"uuid": original_uuid},
+        ).mappings().first()
+
+        if not est_row:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado")
+
+        estaca_id_old = int(est_row["estaca_id"])
+        cliente_id_old = int(est_row["cliente_id"])
+
+        # 2) copia cliente
+        cli_row = db.execute(
+            text("SELECT * FROM clientes WHERE id = :id LIMIT 1"),
+            {"id": cliente_id_old},
+        ).mappings().first()
+        if not cli_row:
+            raise HTTPException(status_code=500, detail="Cliente do ensaio não encontrado")
+
+        cli_data = dict(cli_row)
+        cli_data.pop("id", None)
+
+        cli_cols = ", ".join(cli_data.keys())
+        cli_vals = ", ".join([f":{k}" for k in cli_data.keys()])
+        cliente_id_new = db.execute(
+            text(f"INSERT INTO clientes ({cli_cols}) VALUES ({cli_vals}) RETURNING id"),
+            cli_data,
+        ).scalar_one()
+
+        # 3) copia estaca com novo uuid e origem='escritorio'
+        new_uuid = str(uuid4())
+
+        est_data = dict(est_row)
+        # remove campos que não devem ir no insert
+        est_data.pop("id", None)
+        est_data.pop("estaca_id", None)
+
+        est_data["uuid"] = new_uuid
+        est_data["cliente_id"] = int(cliente_id_new)
+        est_data["origem"] = "escritorio"
+
+        est_cols = ", ".join(est_data.keys())
+        est_vals = ", ".join([f":{k}" for k in est_data.keys()])
+        estaca_id_new = db.execute(
+            text(f"INSERT INTO estacas ({est_cols}) VALUES ({est_vals}) RETURNING id"),
+            est_data,
+        ).scalar_one()
+
+        # 4) copia TODOS equipamentos (se houver histórico)
+        eq_rows = db.execute(
+            text("SELECT * FROM equipamentos WHERE estaca_id = :eid ORDER BY id ASC"),
+            {"eid": estaca_id_old},
+        ).mappings().all()
+
+        for eq in eq_rows:
+            eq_data = dict(eq)
+            eq_data.pop("id", None)
+            eq_data["estaca_id"] = int(estaca_id_new)
+
+            eq_cols = ", ".join(eq_data.keys())
+            eq_vals = ", ".join([f":{k}" for k in eq_data.keys()])
+            db.execute(text(f"INSERT INTO equipamentos ({eq_cols}) VALUES ({eq_vals})"), eq_data)
+
+        # 5) copia TODAS leituras
+        lt_rows = db.execute(
+            text("SELECT * FROM leituras WHERE estaca_id = :eid ORDER BY estagio ASC, row_ord ASC"),
+            {"eid": estaca_id_old},
+        ).mappings().all()
+
+        for lt in lt_rows:
+            lt_data = dict(lt)
+            lt_data.pop("id", None)
+            lt_data["estaca_id"] = int(estaca_id_new)
+
+            lt_cols = ", ".join(lt_data.keys())
+            lt_vals = ", ".join([f":{k}" for k in lt_data.keys()])
+            db.execute(text(f"INSERT INTO leituras ({lt_cols}) VALUES ({lt_vals})"), lt_data)
+
+        db.commit()
+        return DuplicarEnsaioResponse(
+            ok=True,
+            original_uuid=payload.ensaio_uuid,
+            novo_uuid=UUID(new_uuid),
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR /ensaios/duplicar:", repr(e), flush=True)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
