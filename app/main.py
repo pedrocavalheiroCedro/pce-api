@@ -1,5 +1,13 @@
-from app import config  # noqa: F401  (garante load_dotenv)
-from app.schemas import PushPayload, CalibracaoIn, EnsaioPatch, LeituraIn, LeituraPatch
+from app import config  # noqa: F401 (garante load_dotenv)
+from app.schemas import (
+    PushPayload,
+    CalibracaoIn,
+    EnsaioPatch,
+    LeituraIn,
+    LeituraPatch,
+    LeiturasBatchRequest,
+    LeiturasBatchResponse,
+)
 import traceback
 from uuid import UUID
 
@@ -22,9 +30,6 @@ def health():
 
 @app.get("/ensaios")
 def list_ensaios():
-    """
-    Lista ensaios (um por estaca.uuid) em formato de resumo para a tela Arquivos do PCE_Escritório.
-    """
     db = SessionLocal()
     try:
         rows = db.execute(
@@ -59,10 +64,6 @@ def list_ensaios():
 
 @app.get("/ensaios/{uuid}")
 def get_ensaio(uuid: UUID):
-    """
-    Retorna o ensaio completo (cliente + estaca + equipamento + leituras),
-    para abrir no PCE_Escritório.
-    """
     db = SessionLocal()
     try:
         estaca_row = db.execute(
@@ -117,14 +118,7 @@ def get_ensaio(uuid: UUID):
             {"eid": estaca_id},
         ).mappings().first()
 
-        # =====================================================
-        # PATCH: trazer carga_maxima_tf (capacidade máxima) no GET do ensaio
-        #
-        # O PCE_Escritório preenche a "Capac. Máxima (tf)" logo ao abrir o NovoPage.
-        # Antes, esse valor só aparecia depois que a lista completa de calibrações/cilindros
-        # terminava de carregar no frontend. Aqui, buscamos a calibração do cilindro
-        # selecionado e injetamos no bloco "equipamento".
-        # =====================================================
+        # patch do capmax (já aplicado no seu main.py atual)
         cal_row = None
         try:
             if equipamento_row and equipamento_row.get("cilindro_serie"):
@@ -141,7 +135,6 @@ def get_ensaio(uuid: UUID):
                     {"cil": equipamento_row["cilindro_serie"]},
                 ).mappings().first()
         except Exception:
-            # Se por algum motivo a tabela/consulta falhar, não derruba o endpoint.
             cal_row = None
 
         leituras_rows = db.execute(
@@ -179,7 +172,7 @@ def get_ensaio(uuid: UUID):
         }
 
         estaca = {
-            "estaca_id": estaca_row["estaca_id"],  # ✅ ADICIONE ISTO
+            "estaca_id": estaca_row["estaca_id"],
             "uuid": estaca_row["uuid"],
             "carregamento": estaca_row["carregamento"],
             "estaca_num": estaca_row["estaca_num"],
@@ -192,7 +185,6 @@ def get_ensaio(uuid: UUID):
 
         equip = dict(equipamento_row) if equipamento_row else None
         if equip is not None and cal_row:
-            # Mantém o que já veio do equipamento; completa com calibração se estiver faltando.
             if not equip.get("cilindro_area_cm2") and cal_row.get("area_cm2") is not None:
                 equip["cilindro_area_cm2"] = cal_row.get("area_cm2")
             equip["carga_maxima_tf"] = cal_row.get("carga_maxima_tf")
@@ -209,7 +201,7 @@ def get_ensaio(uuid: UUID):
 
 
 # =====================================================
-# ENDPOINTS DE LEITURAS (para leituras_*_page do escritório)
+# ENDPOINTS DE LEITURAS
 # =====================================================
 
 @app.get("/leituras")
@@ -288,14 +280,91 @@ def delete_leitura(leitura_id: int):
 
 
 # =====================================================
-# ENDPOINT PATCH DO ENSAIO (NovoPage do escritório)
+# NOVO: BATCH UPDATE DE LEITURAS POR ENSAIO UUID
+# =====================================================
+
+@app.post("/leituras/batch", response_model=LeiturasBatchResponse)
+def batch_patch_leituras(payload: LeiturasBatchRequest):
+    """
+    Atualiza várias leituras (linhas) de um único ensaio em 1 request.
+    - payload.ensaio_uuid: UUID da estaca
+    - payload.items: lista {leitura_id, patch{...}}
+    """
+    db = SessionLocal()
+    try:
+        # Resolve estaca_id (uma vez)
+        estaca_row = db.execute(
+            text("SELECT id FROM estacas WHERE uuid = :uuid"),
+            {"uuid": str(payload.ensaio_uuid)},
+        ).mappings().first()
+
+        if not estaca_row:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado")
+
+        estaca_id = estaca_row["id"]
+
+        # Se não tem nada para atualizar, ok.
+        if not payload.items:
+            return LeiturasBatchResponse(ok=True, updated=0)
+
+        # Valida que todas as leituras pertencem ao ensaio (evita update fora do ensaio)
+        ids = [it.leitura_id for it in payload.items]
+        rows = db.execute(
+            text(
+                """
+                SELECT id
+                FROM leituras
+                WHERE estaca_id = :eid AND id = ANY(:ids)
+                """
+            ),
+            {"eid": estaca_id, "ids": ids},
+        ).mappings().all()
+        allowed_ids = {r["id"] for r in rows}
+
+        # Atualiza em transação única
+        updated = 0
+        for it in payload.items:
+            if it.leitura_id not in allowed_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Leitura id={it.leitura_id} não pertence ao ensaio {payload.ensaio_uuid}",
+                )
+
+            data = it.patch.model_dump(exclude_none=True)
+            if not data:
+                continue
+
+            set_clause = ", ".join([f"{k} = :{k}" for k in data.keys()])
+            data["id"] = it.leitura_id
+            data["estaca_id"] = estaca_id
+
+            db.execute(
+                text(f"UPDATE leituras SET {set_clause} WHERE id = :id AND estaca_id = :estaca_id"),
+                data,
+            )
+            updated += 1
+
+        db.commit()
+        return LeiturasBatchResponse(ok=True, updated=updated)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# =====================================================
+# PATCH DO ENSAIO
 # =====================================================
 
 @app.patch("/ensaios/{uuid}")
 def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
     db = SessionLocal()
     try:
-        # encontra estaca
         estaca_row = db.execute(
             text("SELECT id, cliente_id FROM estacas WHERE uuid = :uuid"),
             {"uuid": str(uuid)},
@@ -308,7 +377,6 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
 
         data = payload.model_dump(exclude_none=True)
 
-        # separa campos por tabela
         cliente_fields = {}
         estaca_fields = {}
         equip_fields = {}
@@ -334,7 +402,6 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
                 "carga_adm_tf",
                 "carga_ensaio_tf",
             ):
-                # no banco: carregamento
                 if k == "tipo_carregamento":
                     estaca_fields["carregamento"] = v
                 else:
@@ -351,19 +418,16 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
             ):
                 equip_fields[k] = v
 
-        # update clientes
         if cliente_fields:
             set_clause = ", ".join([f"{k} = :{k}" for k in cliente_fields.keys()])
             cliente_fields["id"] = cliente_id
             db.execute(text(f"UPDATE clientes SET {set_clause} WHERE id = :id"), cliente_fields)
 
-        # update estacas
         if estaca_fields:
             set_clause = ", ".join([f"{k} = :{k}" for k in estaca_fields.keys()])
             estaca_fields["id"] = estaca_id
             db.execute(text(f"UPDATE estacas SET {set_clause} WHERE id = :id"), estaca_fields)
 
-        # update/insert equipamentos (pega último e atualiza)
         if equip_fields:
             last_id = db.execute(
                 text("SELECT id FROM equipamentos WHERE estaca_id = :eid ORDER BY id DESC LIMIT 1"),
@@ -392,7 +456,7 @@ def patch_ensaio(uuid: UUID, payload: EnsaioPatch):
 
 
 # =====================================================
-# ENDPOINTS DE CALIBRAÇÕES (para a tela Calibracoes)
+# CALIBRACOES / PUSH (iguais ao seu arquivo atual)
 # =====================================================
 
 @app.get("/calibracoes")
@@ -461,18 +525,10 @@ def delete_calibracao(cal_id: int):
         db.close()
 
 
-# ==========================
-# ENDPOINT "PUSH" (campo -> escritório)
-# ==========================
-
 @app.post("/push")
 def push(payload: PushPayload):
-    """
-    Recebe um ensaio (cliente + estaca + equipamento + leituras) e grava no banco local do escritório.
-    """
     db = SessionLocal()
     try:
-        # 1) upsert cliente por codigo_obra + data_ensaio
         cli = payload.cliente.model_dump()
         codigo_obra = cli.get("codigo_obra")
         data_ensaio = cli.get("data_ensaio")
@@ -502,11 +558,13 @@ def push(payload: PushPayload):
                 cli,
             ).scalar_one()
 
-        # 2) upsert estaca por uuid
         est = payload.estaca.model_dump()
         est_uuid = str(est.get("uuid"))
 
-        row_est = db.execute(text("SELECT id FROM estacas WHERE uuid = :uuid LIMIT 1"), {"uuid": est_uuid}).mappings().first()
+        row_est = db.execute(
+            text("SELECT id FROM estacas WHERE uuid = :uuid LIMIT 1"),
+            {"uuid": est_uuid},
+        ).mappings().first()
         if row_est:
             estaca_id = row_est["id"]
             est["cliente_id"] = cliente_id
@@ -523,14 +581,12 @@ def push(payload: PushPayload):
                 est,
             ).scalar_one()
 
-        # 3) inserir equipamento (sempre cria um novo registro)
         eq = payload.equipamento.model_dump()
         eq["estaca_id"] = estaca_id
         cols = ", ".join(eq.keys())
         vals = ", ".join([f":{k}" for k in eq.keys()])
         db.execute(text(f"INSERT INTO equipamentos ({cols}) VALUES ({vals})"), eq)
 
-        # 4) inserir leituras (apaga e reinsere)
         db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
         for leitura in payload.leituras:
