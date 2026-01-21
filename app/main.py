@@ -597,3 +597,37 @@ def delete_calibracao(cal_id: int):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+@app.get("/leituras")
+def list_leituras(estaca_id: int):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    estaca_id,
+                    estagio, row_ord,
+                    carga_tf, pressao_kgf_cm2,
+                    horario, tempo_estagio, tempo_estagio_min, tempo_total,
+                    leitura_01, leitura_02, leitura_03, leitura_04,
+                    parcial_01, parcial_02, parcial_03, parcial_04,
+                    total_01, total_02, total_03, total_04,
+                    total_media, estabilizado, porcentagem,
+                    grafico, observacao,
+                    obrigatoria, is_referencia,
+                    ref_override_01, ref_override_02, ref_override_03, ref_override_04
+                FROM leituras
+                WHERE estaca_id = :eid
+                ORDER BY estagio ASC, row_ord ASC
+                """
+            ),
+            {"eid": int(estaca_id)},
+        ).mappings().all()
+
+        # ✅ o grafico_page espera "data"
+        return {"data": list(rows)}
+    finally:
+        db.close()
