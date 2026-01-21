@@ -10,6 +10,7 @@ from sqlalchemy import text
 from app.db import SessionLocal
 from app.schemas import (
     PushPayload,
+    CalibracaoIn,
     DuplicarEnsaioRequest,
     DuplicarEnsaioResponse,
 )
@@ -122,6 +123,25 @@ def get_ensaio(uuid: UUID):
             {"eid": estaca_id},
         ).mappings().first()
 
+        # ✅ Recupera calibracao por cilindro_serie (para area e carga_maxima_tf)
+        cal_row = None
+        if equipamento_row and equipamento_row.get("cilindro_serie"):
+            try:
+                cal_row = db.execute(
+                    text(
+                        """
+                        SELECT area_cm2, carga_maxima_tf
+                        FROM calibracoes
+                        WHERE cilindro = :cil
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"cil": equipamento_row["cilindro_serie"]},
+                ).mappings().first()
+            except Exception:
+                cal_row = None
+
         leituras_rows = db.execute(
             text(
                 """
@@ -170,10 +190,19 @@ def get_ensaio(uuid: UUID):
             "carga_ensaio_tf": estaca_row["carga_ensaio_tf"],
         }
 
+        equip = dict(equipamento_row) if equipamento_row else None
+        if equip is not None and cal_row:
+            # ✅ se area não veio no equipamento, usa calibracao
+            if (equip.get("cilindro_area_cm2") is None or str(equip.get("cilindro_area_cm2")) == "") and cal_row.get("area_cm2") is not None:
+                equip["cilindro_area_cm2"] = cal_row.get("area_cm2")
+
+            # ✅ SEMPRE devolve carga_maxima_tf para o novo_page
+            equip["carga_maxima_tf"] = cal_row.get("carga_maxima_tf")
+
         return {
             "cliente": cliente,
             "estaca": estaca,
-            "equipamento": dict(equipamento_row) if equipamento_row else None,
+            "equipamento": equip,
             "leituras": list(leituras_rows),
         }
     finally:
@@ -181,20 +210,14 @@ def get_ensaio(uuid: UUID):
 
 
 # =====================================================
-# PUSH (CAMPO)
-# - compatível com o app do campo (usa /sync/push)
-# - regra exists por (codigo_obra + estaca_num) retornando 409
+# PUSH (CAMPO) - regra 409 exists + BULK INSERT
 # =====================================================
 
 def _find_estaca_by_codigo_estaca(db, codigo_obra: str, estaca_num: str):
-    """
-    Procura um ensaio existente pelo par (codigo_obra + estaca_num).
-    Retorna: {id, uuid, cliente_id} ou None
-    """
     if not codigo_obra or not estaca_num:
         return None
 
-    row = db.execute(
+    return db.execute(
         text(
             """
             SELECT
@@ -211,14 +234,14 @@ def _find_estaca_by_codigo_estaca(db, codigo_obra: str, estaca_num: str):
         ),
         {"codigo_obra": codigo_obra, "estaca_num": estaca_num},
     ).mappings().first()
-    return row
+
 
 def _push_impl(payload: PushPayload):
     db = SessionLocal()
     try:
         overwrite = bool(getattr(payload, "overwrite", False))
 
-        # -------- Cliente (upsert simples por codigo_obra + data_ensaio) --------
+        # -------- Cliente --------
         cli = payload.cliente.model_dump()
         codigo_obra = (cli.get("codigo_obra") or "").strip()
         data_ensaio = cli.get("data_ensaio")
@@ -275,7 +298,6 @@ def _push_impl(payload: PushPayload):
                 db.execute(text("UPDATE estacas SET uuid_origem = uuid WHERE id = :id"), {"id": estaca_id})
 
         else:
-            # regra "exists" antiga por (codigo_obra + estaca_num)
             row_exist = _find_estaca_by_codigo_estaca(db, codigo_obra, estaca_num)
 
             if row_exist:
@@ -315,7 +337,7 @@ def _push_impl(payload: PushPayload):
                     est,
                 ).scalar_one()
 
-        # -------- Equipamentos (mantém comportamento: insere uma linha) --------
+        # -------- Equipamentos --------
         eq = payload.equipamento.model_dump() if payload.equipamento else {}
         if eq:
             eq["estaca_id"] = estaca_id
@@ -326,7 +348,6 @@ def _push_impl(payload: PushPayload):
         # -------- Leituras (BULK INSERT) --------
         db.execute(text("DELETE FROM leituras WHERE estaca_id = :eid"), {"eid": estaca_id})
 
-        # monta lista de dicts
         rows = []
         for leitura in payload.leituras:
             d = leitura.model_dump()
@@ -334,14 +355,11 @@ def _push_impl(payload: PushPayload):
             rows.append(d)
 
         if rows:
-            # garante colunas na mesma ordem do primeiro item
             cols = list(rows[0].keys())
             cols_sql = ", ".join(cols)
             vals_sql = ", ".join([f":{c}" for c in cols])
 
             insert_sql = text(f"INSERT INTO leituras ({cols_sql}) VALUES ({vals_sql})")
-
-            # executa em lote (400 linhas é tranquilo)
             db.execute(insert_sql, rows)
 
         db.commit()
@@ -359,7 +377,6 @@ def _push_impl(payload: PushPayload):
         db.close()
 
 
-# Endpoints "novos"
 @app.post("/push")
 def push(payload: PushPayload):
     return _push_impl(payload)
@@ -370,13 +387,11 @@ def upload(payload: PushPayload):
     return _push_impl(payload)
 
 
-# ✅ Compatibilidade com o app do CAMPO (ele chama /sync/push)
 @app.post("/sync/push")
 def sync_push(payload: PushPayload):
     return _push_impl(payload)
 
 
-# ✅ Compatibilidade extra (caso algum build chame /sync/upload)
 @app.post("/sync/upload")
 def sync_upload(payload: PushPayload):
     return _push_impl(payload)
@@ -388,13 +403,7 @@ def sync_upload(payload: PushPayload):
 
 def _next_escritorio_label(db, uuid_origem: str) -> str:
     rows = db.execute(
-        text(
-            """
-            SELECT origem
-            FROM estacas
-            WHERE uuid_origem = :u
-            """
-        ),
+        text("SELECT origem FROM estacas WHERE uuid_origem = :u"),
         {"u": uuid_origem},
     ).mappings().all()
 
@@ -430,7 +439,6 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
         uuid_origem = str(est_row.get("uuid_origem") or original_uuid)
         origem_label = _next_escritorio_label(db, uuid_origem)
 
-        # copia cliente
         cli_row = db.execute(
             text("SELECT * FROM clientes WHERE id = :id LIMIT 1"),
             {"id": cliente_id_old},
@@ -448,7 +456,6 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
             cli_data,
         ).scalar_one()
 
-        # copia estaca com novo uuid
         new_uuid = str(uuid4())
         est_data = dict(est_row)
         est_data.pop("id", None)
@@ -465,7 +472,6 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
             est_data,
         ).scalar_one()
 
-        # copia equipamentos (todos)
         eq_rows = db.execute(
             text("SELECT * FROM equipamentos WHERE estaca_id = :eid ORDER BY id ASC"),
             {"eid": estaca_id_old},
@@ -479,7 +485,6 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
             eq_vals = ", ".join([f":{k}" for k in eq_data.keys()])
             db.execute(text(f"INSERT INTO equipamentos ({eq_cols}) VALUES ({eq_vals})"), eq_data)
 
-        # copia leituras
         lt_rows = db.execute(
             text("SELECT * FROM leituras WHERE estaca_id = :eid ORDER BY estagio ASC, row_ord ASC"),
             {"eid": estaca_id_old},
@@ -508,6 +513,87 @@ def duplicar_ensaio(payload: DuplicarEnsaioRequest):
         db.rollback()
         print("ERROR /ensaios/duplicar:", repr(e), flush=True)
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# =====================================================
+# CALIBRACOES (voltando endpoints que o escritório usa)
+# =====================================================
+
+@app.get("/calibracoes")
+def list_calibracoes():
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, cilindro, area_cm2, carga_maxima_tf
+                FROM calibracoes
+                ORDER BY cilindro ASC, id ASC
+                """
+            )
+        ).mappings().all()
+        return {"calibracoes": list(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/calibracoes")
+def create_calibracao(payload: CalibracaoIn):
+    db = SessionLocal()
+    try:
+        data = payload.model_dump()
+        cols = ", ".join(data.keys())
+        vals = ", ".join([f":{k}" for k in data.keys()])
+        new_id = db.execute(
+            text(f"INSERT INTO calibracoes ({cols}) VALUES ({vals}) RETURNING id"),
+            data,
+        ).scalar_one()
+        db.commit()
+        return {"id": new_id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.patch("/calibracoes/{cal_id}")
+def patch_calibracao(cal_id: int, payload: CalibracaoIn):
+    db = SessionLocal()
+    try:
+        data = payload.model_dump(exclude_none=True)
+
+        # aceita PATCH parcial, mas mantém compatibilidade do seu frontend:
+        # ele envia cilindro/area/carga sempre.
+        if not data:
+            return {"ok": True}
+
+        set_clause = ", ".join([f"{k} = :{k}" for k in data.keys()])
+        data["id"] = cal_id
+        db.execute(text(f"UPDATE calibracoes SET {set_clause} WHERE id = :id"), data)
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.delete("/calibracoes/{cal_id}")
+def delete_calibracao(cal_id: int):
+    db = SessionLocal()
+    try:
+        db.execute(text("DELETE FROM calibracoes WHERE id = :id"), {"id": cal_id})
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
