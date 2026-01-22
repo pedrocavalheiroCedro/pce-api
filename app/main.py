@@ -1,4 +1,5 @@
 from app import config  # noqa: F401
+from app.schemas import LeiturasBatchRequest, LeiturasBatchResponse  # adicione no topo também
 
 import traceback
 import re
@@ -26,6 +27,65 @@ def health():
 # ==========================
 # ENSAIOS (ESCRITÓRIO)
 # ==========================
+
+
+
+@app.post("/leituras/batch", response_model=LeiturasBatchResponse)
+def leituras_batch(req: LeiturasBatchRequest):
+    db = SessionLocal()
+    try:
+        ensaio_uuid = str(req.ensaio_uuid)
+
+        # 1) acha estaca_id do ensaio
+        est = db.execute(
+            text("SELECT id FROM estacas WHERE uuid = :u LIMIT 1"),
+            {"u": ensaio_uuid},
+        ).mappings().first()
+        if not est:
+            raise HTTPException(status_code=404, detail="Ensaio não encontrado")
+
+        estaca_id = int(est["id"])
+
+        updated = 0
+
+        # 2) aplica patches por leitura_id (somente se pertencer à estaca)
+        for item in req.items:
+            leitura_id = int(item.leitura_id)
+            patch = item.patch.model_dump(exclude_none=True)
+
+            if not patch:
+                continue
+
+            # garante que a leitura pertence ao ensaio
+            ok_row = db.execute(
+                text("SELECT id FROM leituras WHERE id = :lid AND estaca_id = :eid LIMIT 1"),
+                {"lid": leitura_id, "eid": estaca_id},
+            ).mappings().first()
+            if not ok_row:
+                continue
+
+            set_clause = ", ".join([f"{k} = :{k}" for k in patch.keys()])
+            patch["id"] = leitura_id
+            db.execute(text(f"UPDATE leituras SET {set_clause} WHERE id = :id"), patch)
+            updated += 1
+
+        db.commit()
+        return LeiturasBatchResponse(ok=True, updated=updated)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print("ERROR /leituras/batch:", repr(e), flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+
+
 
 @app.get("/ensaios")
 def list_ensaios():
